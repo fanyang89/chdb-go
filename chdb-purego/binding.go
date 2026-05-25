@@ -8,6 +8,75 @@ import (
 	"github.com/ebitengine/purego"
 )
 
+// sigactionBufSize is large enough to hold a struct sigaction on every
+// platform we care about: 16 B on macOS, ~152 B on glibc/Linux.
+const sigactionBufSize = 256
+
+// signalsToProtect lists the signals the Go runtime owns and must keep
+// owning. libchdb's chdb_set_signal_handlers_enabled(0) wipes the kernel's
+// handler list for the same set as a side effect; we save and restore these
+// around that call so Go's handlers survive.
+//
+// Numeric values are POSIX and identical on Linux and macOS.
+var signalsToProtect = []int{
+	4,  // SIGILL
+	6,  // SIGABRT
+	8,  // SIGFPE
+	10, // SIGBUS
+	11, // SIGSEGV
+	16, // SIGURG  (Go uses this for async preemption)
+}
+
+// libcSigaction is the libc sigaction(2) function, resolved from whichever
+// libc the process was already linked against. We pass opaque buffers
+// rather than typed structs so the same code works for the differently-
+// laid-out struct sigaction on macOS vs glibc.
+var libcSigaction func(sig int, act, oact unsafe.Pointer) int
+
+func loadSigaction() {
+	// Try the libc that this process was already linked against.
+	// Order matters: try platform-canonical paths first.
+	candidates := []string{
+		"/usr/lib/libSystem.B.dylib", // macOS
+		"libc.so.6",                  // glibc (ldconfig will resolve)
+		"/lib/x86_64-linux-gnu/libc.so.6",
+		"/lib/aarch64-linux-gnu/libc.so.6",
+		"libc.so", // musl + general fallback
+	}
+	var libc uintptr
+	var lastErr error
+	for _, p := range candidates {
+		if lib, err := purego.Dlopen(p, purego.RTLD_NOW|purego.RTLD_GLOBAL); err == nil {
+			libc = lib
+			lastErr = nil
+			break
+		} else {
+			lastErr = err
+		}
+	}
+	if libc == 0 {
+		panic("chdb-purego: cannot dlopen libc to resolve sigaction(2): " + lastErr.Error())
+	}
+	purego.RegisterLibFunc(&libcSigaction, libc, "sigaction")
+}
+
+// snapshotSignalHandlers stores the current sigaction state for the signals
+// we need to protect, in opaque buffers.
+func snapshotSignalHandlers() [][sigactionBufSize]byte {
+	saved := make([][sigactionBufSize]byte, len(signalsToProtect))
+	for i, sig := range signalsToProtect {
+		libcSigaction(sig, nil, unsafe.Pointer(&saved[i][0]))
+	}
+	return saved
+}
+
+// restoreSignalHandlers writes a previously-snapshotted sigaction state back.
+func restoreSignalHandlers(saved [][sigactionBufSize]byte) {
+	for i, sig := range signalsToProtect {
+		libcSigaction(sig, unsafe.Pointer(&saved[i][0]), nil)
+	}
+}
+
 func findLibrary() string {
 	// Env var
 	if envPath := os.Getenv("CHDB_LIB_PATH"); envPath != "" {
@@ -66,6 +135,13 @@ var (
 	chdbResultStorageRowsRead  func(result *chdb_result) uint64
 	chdbResultStorageBytesRead func(result *chdb_result) uint64
 	chdbResultError            func(result *chdb_result) string
+
+	// Process-wide signal handler control. See issue #30: by default libchdb
+	// installs its own SIGSEGV/SIGABRT/SIGBUS/SIGILL handlers when a
+	// connection is opened, which overwrites the Go runtime's handlers and
+	// breaks async preemption (SIGURG) and stack-growth (SIGSEGV) handling.
+	chdbSetSignalHandlersEnabled func(enabled int)
+	chdbResetSignalHandlers      func()
 )
 
 func init() {
@@ -105,4 +181,29 @@ func init() {
 	purego.RegisterLibFunc(&chdbResultStorageBytesRead, libchdb, "chdb_result_storage_bytes_read")
 	purego.RegisterLibFunc(&chdbResultError, libchdb, "chdb_result_error")
 
+	purego.RegisterLibFunc(&chdbSetSignalHandlersEnabled, libchdb, "chdb_set_signal_handlers_enabled")
+	purego.RegisterLibFunc(&chdbResetSignalHandlers, libchdb, "chdb_reset_signal_handlers")
+
+	// Tell libchdb NOT to install its own signal handlers on the first
+	// chdb_connect(). Without this, libchdb's ClickHouse daemon code
+	// installs handlers for SIGSEGV / SIGABRT / SIGBUS / SIGILL / SIGFPE
+	// the first time a connection is opened, overwriting the handlers
+	// the Go runtime relies on for stack growth and panic recovery. When
+	// a Go signal then lands in libchdb's handler instead of the
+	// runtime's, the result is the rare std::mutex::unlock crash
+	// described in issue #30 — most often on macOS arm64 CI where signal
+	// pressure is highest.
+	//
+	// Important: chdb_set_signal_handlers_enabled(0) doesn't only set a
+	// flag — it also wipes the existing handlers in the same set back to
+	// SIG_DFL (verified empirically; the chdb.h header doesn't mention
+	// this side effect). Since the Go runtime has already installed its
+	// handlers by the time this package's init runs, we have to save Go's
+	// handlers, call the disable, then restore them. After this dance the
+	// libchdb flag is set (so no future connect installs handlers) and
+	// Go's handlers remain in place.
+	loadSigaction()
+	saved := snapshotSignalHandlers()
+	chdbSetSignalHandlersEnabled(0)
+	restoreSignalHandlers(saved)
 }

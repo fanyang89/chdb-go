@@ -222,7 +222,15 @@ func NewConnection(argc int, argv []string) (ChdbConn, error) {
 				err = fmt.Errorf("C++ exception: %v", r)
 			}
 		}()
+		// chdb_connect — even after chdb_set_signal_handlers_enabled(0) —
+		// still resets the kernel sigaction table for SIGSEGV / SIGABRT /
+		// SIGBUS / SIGILL / SIGFPE to SIG_DFL on the first call (verified
+		// empirically; see issue #30 for context). Snapshot Go's
+		// handlers and restore them on return so the runtime keeps its
+		// stack-growth / panic-recovery handlers.
+		saved := snapshotSignalHandlers()
 		conn = chdbConnect(len(new_argv), c_argv)
+		restoreSignalHandlers(saved)
 	}()
 
 	if err != nil {
