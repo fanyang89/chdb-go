@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // TestSignalHandlersPreservedAcrossConnect is the regression guard for issue
@@ -45,6 +46,57 @@ func TestSignalHandlersPreservedAcrossConnect(t *testing.T) {
 		if !bytes.Equal(before[i][:8], after[i][:8]) {
 			t.Errorf("sig=%d: handler pointer changed across chdb_connect\n  before=% x\n  after =% x",
 				sig, before[i][:8], after[i][:8])
+		}
+	}
+}
+
+// TestSignalHandlersRestoredAfterPanic models the failure mode flagged in PR
+// review: if the section between snapshot and restore panics, the inline
+// "restore" call would be skipped and the rest of the process would be left
+// with the wiped sigaction state. Using `defer restoreSignalHandlers(saved)`
+// makes the restore unconditional. This test wipes a handler, panics, and
+// asserts that on unwinding the handler is back to what we snapshotted.
+func TestSignalHandlersRestoredAfterPanic(t *testing.T) {
+	initial := snapshotSignalHandlers()
+
+	recovered := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				recovered = true
+			}
+		}()
+
+		saved := snapshotSignalHandlers()
+		defer restoreSignalHandlers(saved)
+
+		// Simulate libchdb wiping every protected handler to SIG_DFL.
+		var dflBuf [sigactionBufSize]byte // zeroed = SIG_DFL on every POSIX
+		for _, sig := range signalsToProtect {
+			libcSigaction(sig, unsafe.Pointer(&dflBuf[0]), nil)
+		}
+
+		// Confirm the simulated wipe took effect — otherwise the test is
+		// vacuously passing.
+		wiped := snapshotSignalHandlers()
+		for i, sig := range signalsToProtect {
+			if bytes.Equal(saved[i][:8], wiped[i][:8]) {
+				t.Fatalf("sig=%d: simulated wipe didn't change handler; libcSigaction call may be broken", sig)
+			}
+		}
+
+		panic("simulating a C++ exception propagating out of chdb_connect")
+	}()
+
+	if !recovered {
+		t.Fatal("expected panic to be recovered by outer defer")
+	}
+
+	after := snapshotSignalHandlers()
+	for i, sig := range signalsToProtect {
+		if !bytes.Equal(initial[i][:8], after[i][:8]) {
+			t.Errorf("sig=%d: handler NOT restored after panic\n  initial=% x\n  after  =% x",
+				sig, initial[i][:8], after[i][:8])
 		}
 	}
 }

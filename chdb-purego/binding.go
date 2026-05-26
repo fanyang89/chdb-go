@@ -3,6 +3,7 @@ package chdbpurego
 import (
 	"os"
 	"os/exec"
+	"syscall"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -17,14 +18,17 @@ const sigactionBufSize = 256
 // handler list for the same set as a side effect; we save and restore these
 // around that call so Go's handlers survive.
 //
-// Numeric values are POSIX and identical on Linux and macOS.
+// Signal numbers are NOT the same on Linux and macOS (e.g. SIGBUS is 10 on
+// Darwin but 7 on Linux; SIGURG is 16 on Darwin but 23 on Linux). Use the
+// syscall package's per-platform constants so the values resolve correctly
+// at compile time on each OS.
 var signalsToProtect = []int{
-	4,  // SIGILL
-	6,  // SIGABRT
-	8,  // SIGFPE
-	10, // SIGBUS
-	11, // SIGSEGV
-	16, // SIGURG  (Go uses this for async preemption)
+	int(syscall.SIGILL),
+	int(syscall.SIGABRT),
+	int(syscall.SIGFPE),
+	int(syscall.SIGBUS),
+	int(syscall.SIGSEGV),
+	int(syscall.SIGURG), // Go uses SIGURG for async preemption
 }
 
 // libcSigaction is the libc sigaction(2) function, resolved from whichever

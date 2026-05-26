@@ -217,20 +217,27 @@ func NewConnection(argc int, argv []string) (ChdbConn, error) {
 	var conn *chdb_connection
 	var err error
 	func() {
+		// chdb_connect — even after chdb_set_signal_handlers_enabled(0) —
+		// still resets the kernel sigaction table for SIGSEGV / SIGABRT /
+		// SIGBUS / SIGILL / SIGFPE to SIG_DFL on the first call (verified
+		// empirically; see issue #30 for context). Snapshot Go's handlers
+		// and restore them on return so the runtime keeps its stack-growth
+		// / panic-recovery handlers.
+		//
+		// Restore is deferred BEFORE the panic-recovery defer so that even
+		// if chdb_connect panics (e.g. C++ exception propagated through
+		// purego), Go's handlers are still put back before this function
+		// unwinds — otherwise the rest of the process would be left with
+		// SIG_DFL for these signals.
+		saved := snapshotSignalHandlers()
+		defer restoreSignalHandlers(saved)
+
 		defer func() {
 			if r := recover(); r != nil {
 				err = fmt.Errorf("C++ exception: %v", r)
 			}
 		}()
-		// chdb_connect — even after chdb_set_signal_handlers_enabled(0) —
-		// still resets the kernel sigaction table for SIGSEGV / SIGABRT /
-		// SIGBUS / SIGILL / SIGFPE to SIG_DFL on the first call (verified
-		// empirically; see issue #30 for context). Snapshot Go's
-		// handlers and restore them on return so the runtime keeps its
-		// stack-growth / panic-recovery handlers.
-		saved := snapshotSignalHandlers()
 		conn = chdbConnect(len(new_argv), c_argv)
-		restoreSignalHandlers(saved)
 	}()
 
 	if err != nil {
