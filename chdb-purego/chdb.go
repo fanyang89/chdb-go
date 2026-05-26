@@ -217,6 +217,23 @@ func NewConnection(argc int, argv []string) (ChdbConn, error) {
 	var conn *chdb_connection
 	var err error
 	func() {
+		// chdb_connect — even after chdb_set_signal_handlers_enabled(0) —
+		// still resets the kernel sigaction table for SIGSEGV / SIGABRT /
+		// SIGBUS / SIGILL / SIGFPE to SIG_DFL on the first call (verified
+		// empirically; see issue #30 for context). guardSignalHandlers
+		// snapshots Go's handlers now and the deferred closure restores
+		// them on return — even if chdb_connect panics (a C++ exception
+		// propagated through purego), the LIFO defer order runs
+		// recover() first to set err and then the restore, leaving the
+		// process with Go's stack-growth / panic-recovery handlers
+		// intact.
+		//
+		// On old libchdb builds that don't export the signal-handler
+		// control API, guardSignalHandlers returns a no-op closure and
+		// the call site behaves exactly as it did before the issue #30
+		// fix landed.
+		defer guardSignalHandlers()()
+
 		defer func() {
 			if r := recover(); r != nil {
 				err = fmt.Errorf("C++ exception: %v", r)
