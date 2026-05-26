@@ -207,9 +207,10 @@ func init() {
 		// (so no future connect installs handlers) and Go's handlers
 		// remain in place.
 		loadSigaction()
-		saved := snapshotSignalHandlers()
-		chdbSetSignalHandlersEnabled(0)
-		restoreSignalHandlers(saved)
+		func() {
+			defer guardSignalHandlers()()
+			chdbSetSignalHandlersEnabled(0)
+		}()
 	}
 }
 
