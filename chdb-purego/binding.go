@@ -176,29 +176,58 @@ func init() {
 	purego.RegisterLibFunc(&chdbResultStorageBytesRead, libchdb, "chdb_result_storage_bytes_read")
 	purego.RegisterLibFunc(&chdbResultError, libchdb, "chdb_result_error")
 
-	purego.RegisterLibFunc(&chdbSetSignalHandlersEnabled, libchdb, "chdb_set_signal_handlers_enabled")
-	purego.RegisterLibFunc(&chdbResetSignalHandlers, libchdb, "chdb_reset_signal_handlers")
+	// Signal handler protection (issue #30). The required API was added in
+	// libchdb v26.x via chdb-core#11. Pre-check the symbol with Dlsym so
+	// that older libchdb builds — which don't export
+	// chdb_set_signal_handlers_enabled — degrade gracefully instead of
+	// panicking inside RegisterLibFunc at init. On those builds the crash
+	// from issue #30 stays unfixed, but the binding still loads.
+	if sym, dlsymErr := purego.Dlsym(libchdb, "chdb_set_signal_handlers_enabled"); dlsymErr == nil && sym != 0 {
+		purego.RegisterLibFunc(&chdbSetSignalHandlersEnabled, libchdb, "chdb_set_signal_handlers_enabled")
+		purego.RegisterLibFunc(&chdbResetSignalHandlers, libchdb, "chdb_reset_signal_handlers")
 
-	// Tell libchdb NOT to install its own signal handlers on the first
-	// chdb_connect(). Without this, libchdb's ClickHouse daemon code
-	// installs handlers for SIGSEGV / SIGABRT / SIGBUS / SIGILL / SIGFPE
-	// the first time a connection is opened, overwriting the handlers
-	// the Go runtime relies on for stack growth and panic recovery. When
-	// a Go signal then lands in libchdb's handler instead of the
-	// runtime's, the result is the rare std::mutex::unlock crash
-	// described in issue #30 — most often on macOS arm64 CI where signal
-	// pressure is highest.
-	//
-	// Important: chdb_set_signal_handlers_enabled(0) doesn't only set a
-	// flag — it also wipes the existing handlers in the same set back to
-	// SIG_DFL (verified empirically; the chdb.h header doesn't mention
-	// this side effect). Since the Go runtime has already installed its
-	// handlers by the time this package's init runs, we have to save Go's
-	// handlers, call the disable, then restore them. After this dance the
-	// libchdb flag is set (so no future connect installs handlers) and
-	// Go's handlers remain in place.
-	loadSigaction()
+		// Tell libchdb NOT to install its own signal handlers on the
+		// first chdb_connect(). Without this, libchdb's ClickHouse
+		// daemon code installs handlers for SIGSEGV / SIGABRT / SIGBUS
+		// / SIGILL / SIGFPE the first time a connection is opened,
+		// overwriting the handlers the Go runtime relies on for stack
+		// growth and panic recovery. When a Go signal then lands in
+		// libchdb's handler instead of the runtime's, the result is
+		// the rare std::mutex::unlock crash described in issue #30 —
+		// most often on macOS arm64 CI where signal pressure is
+		// highest.
+		//
+		// Important: chdb_set_signal_handlers_enabled(0) doesn't only
+		// set a flag — it also wipes the existing handlers in the same
+		// set back to SIG_DFL (verified empirically; the chdb.h header
+		// doesn't mention this side effect). Since the Go runtime has
+		// already installed its handlers by the time this package's
+		// init runs, we have to save Go's handlers, call the disable,
+		// then restore them. After this dance the libchdb flag is set
+		// (so no future connect installs handlers) and Go's handlers
+		// remain in place.
+		loadSigaction()
+		saved := snapshotSignalHandlers()
+		chdbSetSignalHandlersEnabled(0)
+		restoreSignalHandlers(saved)
+	}
+}
+
+// signalProtectionAvailable reports whether the running libchdb exposes the
+// signal handler control API. When false, snapshotSignalHandlers and
+// restoreSignalHandlers must NOT be called (libcSigaction was not loaded).
+func signalProtectionAvailable() bool {
+	return chdbSetSignalHandlersEnabled != nil
+}
+
+// guardSignalHandlers returns a function suitable for `defer`-ing around a
+// call into libchdb. When signal protection is available, it captures the
+// current sigaction state now and the returned closure restores it. When
+// not available (old libchdb), both calls are no-ops.
+func guardSignalHandlers() func() {
+	if !signalProtectionAvailable() {
+		return func() {}
+	}
 	saved := snapshotSignalHandlers()
-	chdbSetSignalHandlersEnabled(0)
-	restoreSignalHandlers(saved)
+	return func() { restoreSignalHandlers(saved) }
 }

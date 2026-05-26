@@ -21,6 +21,9 @@ import (
 // breaks Go's stack growth and panic recovery; under load it surfaces as the
 // rare std::mutex::unlock crash reported on macOS arm64.
 func TestSignalHandlersPreservedAcrossConnect(t *testing.T) {
+	if !signalProtectionAvailable() {
+		t.Skip("libchdb does not export chdb_set_signal_handlers_enabled; protection disabled on this build")
+	}
 	before := snapshotSignalHandlers()
 
 	conn, err := NewConnectionFromConnString(":memory:")
@@ -57,6 +60,9 @@ func TestSignalHandlersPreservedAcrossConnect(t *testing.T) {
 // makes the restore unconditional. This test wipes a handler, panics, and
 // asserts that on unwinding the handler is back to what we snapshotted.
 func TestSignalHandlersRestoredAfterPanic(t *testing.T) {
+	if !signalProtectionAvailable() {
+		t.Skip("libchdb does not export chdb_set_signal_handlers_enabled; protection disabled on this build")
+	}
 	initial := snapshotSignalHandlers()
 
 	recovered := false
