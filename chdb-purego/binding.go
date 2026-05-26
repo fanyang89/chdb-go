@@ -38,28 +38,19 @@ var signalsToProtect = []int{
 var libcSigaction func(sig int, act, oact unsafe.Pointer) int
 
 func loadSigaction() {
-	// Try the libc that this process was already linked against.
-	// Order matters: try platform-canonical paths first.
-	candidates := []string{
-		"/usr/lib/libSystem.B.dylib", // macOS
-		"libc.so.6",                  // glibc (ldconfig will resolve)
-		"/lib/x86_64-linux-gnu/libc.so.6",
-		"/lib/aarch64-linux-gnu/libc.so.6",
-		"libc.so", // musl + general fallback
+	// Prefer the empty-path form: on Linux (glibc, musl) dlopen("") returns
+	// a handle to the running process's symbol table, which always contains
+	// sigaction because libc is already loaded by the Go runtime. No path
+	// to maintain.
+	libc, err := purego.Dlopen("", purego.RTLD_NOW)
+	if err != nil {
+		// macOS dyld interprets "" as a file lookup, not as "current
+		// process", so the empty-path form fails. Fall back to libSystem,
+		// which is always present and always contains sigaction.
+		libc, err = purego.Dlopen("/usr/lib/libSystem.B.dylib", purego.RTLD_NOW)
 	}
-	var libc uintptr
-	var lastErr error
-	for _, p := range candidates {
-		if lib, err := purego.Dlopen(p, purego.RTLD_NOW|purego.RTLD_GLOBAL); err == nil {
-			libc = lib
-			lastErr = nil
-			break
-		} else {
-			lastErr = err
-		}
-	}
-	if libc == 0 {
-		panic("chdb-purego: cannot dlopen libc to resolve sigaction(2): " + lastErr.Error())
+	if err != nil {
+		panic("chdb-purego: cannot resolve sigaction(2): " + err.Error())
 	}
 	purego.RegisterLibFunc(&libcSigaction, libc, "sigaction")
 }
